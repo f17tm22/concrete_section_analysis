@@ -2,7 +2,7 @@ import sys
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QGroupBox, QLabel, QComboBox, QSpinBox, 
                             QDoubleSpinBox, QPushButton, QGridLayout, QTabWidget,
-                            QMessageBox, QSplitter, QFileDialog, QLineEdit)
+                            QMessageBox, QSplitter, QFileDialog, QLineEdit, QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 import matplotlib
@@ -12,7 +12,8 @@ import sys
 import os
 sys.path.append(os.path.dirname(__file__))
 from analyzer_ver1 import RCSectionAnalyzer
-from irregular_section import analyze_irregular_section_from_config
+from irregular_section import analyze_irregular_section_from_config, load_irregular_section_config
+import numpy as np
 
 # 配置matplotlib字体设置
 matplotlib.rcParams['font.family'] = 'sans-serif'
@@ -90,6 +91,115 @@ class AnalysisThread(QThread):
             self.analysis_done.emit({"error": str(e)})
 
 
+class NMSweepThread(QThread):
+    """用于计算 Nu-Mu 曲线的后台线程：对一系列轴力求极限弯矩"""
+    nm_done = pyqtSignal(dict)
+
+    def __init__(self, analyzer, params):
+        super().__init__()
+        self.analyzer = analyzer
+        self.params = params
+
+    def run(self):
+        try:
+            # 检查截面类型
+            if self.params.get("section_type") == "irregular":
+                # 不规则截面处理
+                config_file = self.params.get("config_file")
+                if not config_file:
+                    self.nm_done.emit({"error": "未选择不规则截面配置文件"})
+                    return
+                
+                # 加载配置
+                try:
+                    config = load_irregular_section_config(config_file)
+                except Exception as e:
+                    self.nm_done.emit({"error": f"加载配置文件失败: {str(e)}"})
+                    return
+
+                # 设置材料
+                materials = config['materials']
+                self.analyzer.set_materials(materials['concrete_type'], materials['steel_type'])
+
+                # 解析几何参数
+                geometry = config['geometry']
+                contour_points = []
+                for point in geometry['contour_points']:
+                    contour_points.append((point['y'], point['half_width']))
+
+                # 计算钢筋面积并设置截面
+                reinforcement = config['reinforcement']
+                cover = reinforcement['cover_thickness']
+                
+                # 构建传递给 analyzer 的 reinforcement 字典
+                reinforcement_dict = {}
+                for layer_name, layer_info in reinforcement['layers'].items():
+                    count = layer_info['count']
+                    diameter = layer_info['diameter']
+                    area = count * np.pi * (diameter / 2) ** 2
+                    
+                    # 获取深度或覆盖层
+                    depth = (cover if layer_info.get('cover_override') is None else layer_info.get('cover_override'))
+                    
+                    reinforcement_dict[layer_name] = {
+                        "area": area,
+                        "depth": depth
+                    }
+                    # 如果配置中包含 y 坐标，则传递给 analyzer
+                    if 'y' in layer_info:
+                        reinforcement_dict[layer_name]['y'] = layer_info['y']
+                
+                self.analyzer.set_section(contour_points, reinforcement_dict)
+                
+                # 获取分析参数中的曲率范围
+                analysis_config = config.get('analysis', {})
+                curvature_range = analysis_config.get('curvature_range', {})
+                kappa_end_config = curvature_range.get('end', 0.002)
+            else:
+                # 矩形截面处理
+                self.analyzer.set_materials(self.params["concrete"], self.params["steel"])
+                self.analyzer.set_section(
+                    [self.params["width"], self.params["height"]],
+                    {
+                        "top": {"area": self.params["top_area"], "depth": self.params["top_cover"]},
+                        "bottom": {"area": self.params["bottom_area"], "depth": self.params["bottom_cover"]}
+                    }
+                )
+                kappa_end_config = 0.0015
+
+            N_min = self.params.get("N_min", -2000.0) * 1000.0
+            N_max = self.params.get("N_max", 2000.0) * 1000.0
+            n_steps = int(self.params.get("n_steps", 21))
+
+            Ns = []  # kN
+            Ms = []  # kN·m
+
+            if n_steps < 2:
+                n_steps = 2
+
+            for i in range(n_steps):
+                N_i = N_min + (N_max - N_min) * i / (n_steps - 1)
+                # 对每个轴力求极限弯矩，复用 analyze_full_range
+                res = self.analyzer.analyze_full_range(
+                    N_target=N_i,
+                    kappa_start=0,
+                    kappa_end=kappa_end_config,
+                    n_steps=self.params.get("analysis_steps", 200)
+                )
+
+                if res and "moments" in res and res["moments"]:
+                    max_M = max(res["moments"]) / 1e6  # 转换为 kN·m
+                else:
+                    max_M = 0.0
+
+                Ns.append(N_i / 1000.0)
+                Ms.append(max_M)
+
+            self.nm_done.emit({"Ns": Ns, "Ms": Ms})
+        except Exception as e:
+            self.nm_done.emit({"error": str(e)})
+
+
 class MplCanvas(FigureCanvas):
     """Matplotlib画布封装类"""
     def __init__(self, parent=None, width=5, height=4, dpi=100):
@@ -106,6 +216,7 @@ class RCSectionAnalysisGUI(QMainWindow):
         super().__init__()
         self.analyzer = RCSectionAnalyzer()
         self.analysis_thread = None  # 分析线程对象
+        self.nm_thread = None  # Nu-Mu 计算线程
         self.initUI()
         
     def initUI(self):
@@ -117,8 +228,46 @@ class RCSectionAnalysisGUI(QMainWindow):
         # 创建主部件和布局
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout(main_widget)
+        # 使用垂直布局：上方为 Nu-Mu 控件栏，下方为左右分割主视图
+        main_layout = QVBoxLayout(main_widget)
         
+        # 在顶部添加 Nu-Mu 曲线控制栏
+        top_bar = QWidget()
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.addWidget(QLabel("N 范围 (kN):"))
+        self.N_min_spin = QDoubleSpinBox()
+        self.N_min_spin.setRange(-10000, 10000)
+        self.N_min_spin.setValue(0)
+        self.N_min_spin.setSingleStep(10)
+        top_layout.addWidget(self.N_min_spin)
+
+        top_layout.addWidget(QLabel("到"))
+        self.N_max_spin = QDoubleSpinBox()
+        self.N_max_spin.setRange(-10000, 10000)
+        self.N_max_spin.setValue(2000)
+        self.N_max_spin.setSingleStep(10)
+        top_layout.addWidget(self.N_max_spin)
+
+        top_layout.addWidget(QLabel("步数:"))
+        self.N_steps_spin = QSpinBox()
+        self.N_steps_spin.setRange(2, 201)
+        self.N_steps_spin.setValue(21)
+        top_layout.addWidget(self.N_steps_spin)
+
+        self.nm_btn = QPushButton("绘制 Nu-Mu 曲线")
+        self.nm_btn.clicked.connect(self.perform_NM_analysis)
+        top_layout.addWidget(self.nm_btn)
+
+        self.hold_curves_cb = QCheckBox("保留曲线")
+        self.hold_curves_cb.setToolTip("勾选后，新绘制的曲线将叠加在现有图表上，方便对比不同配筋方案")
+        top_layout.addWidget(self.hold_curves_cb)
+
+        self.clear_nm_btn = QPushButton("清除图表")
+        self.clear_nm_btn.clicked.connect(self.clear_nm_chart)
+        top_layout.addWidget(self.clear_nm_btn)
+
+        main_layout.addWidget(top_bar)
+
         # 创建分割器
         splitter = QSplitter(Qt.Orientation.Horizontal)
         
@@ -319,6 +468,10 @@ class RCSectionAnalysisGUI(QMainWindow):
         # 中和轴应变曲线标签页
         self.neutral_axis_canvas = MplCanvas(self, width=5, height=4, dpi=100)
         self.tabs.addTab(self.neutral_axis_canvas, "中和轴应变")
+
+        # Nu-Mu 曲线标签页
+        self.nm_canvas = MplCanvas(self, width=5, height=4, dpi=100)
+        self.tabs.addTab(self.nm_canvas, "Nu-Mu 曲线")
         
         # 添加标签页到右侧布局
         right_layout.addWidget(self.tabs)
@@ -443,6 +596,109 @@ class RCSectionAnalysisGUI(QMainWindow):
         self.analysis_thread.analysis_done.connect(self.on_analysis_finished)
         self.analysis_thread.finished.connect(self.on_thread_finished)  # 线程结束信号
         self.analysis_thread.start()
+
+    def perform_NM_analysis(self):
+        """对 N 范围进行扫描，绘制 Nu-Mu 弹塑性曲线（后台线程）"""
+        # 如果已有 Nu-Mu 线程在运行，先终止
+        if self.nm_thread and self.nm_thread.isRunning():
+            self.nm_thread.terminate()
+
+        # 基本输入校验
+        N_min = self.N_min_spin.value()
+        N_max = self.N_max_spin.value()
+        n_steps = self.N_steps_spin.value()
+        if n_steps < 2:
+            QMessageBox.warning(self, "参数错误", "请设置至少 2 个步数")
+            return
+
+        # 禁用按钮与提示
+        self.nm_btn.setEnabled(False)
+        self.nm_btn.setText("计算中...")
+
+        params = {
+            "concrete": self.concrete_combo.currentText(),
+            "steel": self.steel_combo.currentText(),
+            "width": self.width_spin.value(),
+            "height": self.height_spin.value(),
+            "top_area": self.calculate_steel_area(self.top_count_spin.value(), self.top_dia_spin.value()),
+            "top_cover": self.top_cover_spin.value(),
+            "bottom_area": self.calculate_steel_area(self.bottom_count_spin.value(), self.bottom_dia_spin.value()),
+            "bottom_cover": self.bottom_cover_spin.value(),
+            "N_min": N_min,
+            "N_max": N_max,
+            "n_steps": n_steps,
+            "analysis_steps": self.step_spin.value(),
+        }
+
+        # 如果是不规则截面，告诉线程使用配置文件分析
+        if self.section_type_combo.currentData() == "irregular":
+            config_file = self.config_file_edit.text().strip()
+            if not config_file:
+                QMessageBox.warning(self, "参数错误", "不规则截面请先选择配置文件")
+                self.nm_btn.setEnabled(True)
+                self.nm_btn.setText("绘制 Nu-Mu 曲线")
+                return
+            # QMessageBox.information(self, "提示", "当前 Nu-Mu 扫描对不规则截面可能不完全支持；将尝试使用配置文件进行分析。")
+            params["config_file"] = config_file
+
+        # 创建新线程（复用主 analyzer 可能不线程安全，但这里简化处理）
+        self.nm_thread = NMSweepThread(self.analyzer, params)
+        self.nm_thread.nm_done.connect(self.on_nm_finished)
+        self.nm_thread.finished.connect(self.on_nm_thread_finished)
+        self.nm_thread.start()
+
+    def on_nm_finished(self, results):
+        """Nu-Mu 计算完成回调，绘图"""
+        if "error" in results:
+            QMessageBox.critical(self, "Nu-Mu 计算错误", f"计算过程中发生错误: {results['error']}")
+            return
+
+        Ns = results.get("Ns", [])
+        Ms = results.get("Ms", [])
+
+        # 过滤掉 N < 0 的数据点
+        filtered_Ns = []
+        filtered_Ms = []
+        for n, m in zip(Ns, Ms):
+            if n >= 0:
+                filtered_Ns.append(n)
+                filtered_Ms.append(m)
+
+        # 如果不保留曲线，则清除画布
+        if not self.hold_curves_cb.isChecked():
+            self.nm_canvas.axes.clear()
+            self.nm_canvas.axes.grid(True)
+        
+        # 绘制曲线：交换坐标轴，M 为横轴，N 为纵轴
+        # 使用不同颜色或标记以便区分（这里简单使用默认颜色循环）
+        line, = self.nm_canvas.axes.plot(filtered_Ms, filtered_Ns, '.-', label=f'As={self.steel_area_label.text()}')
+        
+        self.nm_canvas.axes.set_title('Nu-Mu 相互作用曲线')
+        self.nm_canvas.axes.set_xlabel('极限弯矩 Mu (kN·m)')
+        self.nm_canvas.axes.set_ylabel('轴力 Nu (kN)')
+        
+        # 只有在第一次绘制或清除后才设置 grid，避免重复
+        self.nm_canvas.axes.grid(True)
+        
+        # 尝试添加图例（如果有多条线）
+        # self.nm_canvas.axes.legend() 
+        
+        self.nm_canvas.fig.tight_layout()
+        self.nm_canvas.draw()
+
+    def clear_nm_chart(self):
+        """清除 N-M 图表"""
+        self.nm_canvas.axes.clear()
+        self.nm_canvas.axes.grid(True)
+        self.nm_canvas.axes.set_title('Nu-Mu 相互作用曲线')
+        self.nm_canvas.axes.set_xlabel('极限弯矩 Mu (kN·m)')
+        self.nm_canvas.axes.set_ylabel('轴力 Nu (kN)')
+        self.nm_canvas.draw()
+
+    def on_nm_thread_finished(self):
+        """Nu-Mu 线程结束，恢复按钮状态"""
+        self.nm_btn.setEnabled(True)
+        self.nm_btn.setText("绘制 Nu-Mu 曲线")
     
     def on_analysis_finished(self, results):
         """分析完成回调函数，在主线程中执行"""

@@ -9,10 +9,10 @@ class Material:
         
         # 上升段：抛物线（ε ≤ ε0）
         if epsilon <= eps0:
-            return f_cd * (2 * (epsilon / eps0) - (epsilon / eps0) ** 2)
+            return -f_cd * (2 * (epsilon / eps0) - (epsilon / eps0) ** 2)
         # 下降段：斜直线（ε0 < ε ≤ εu）
         elif epsilon <= epsu:
-            return f_cd * (1 - 0.8 * (epsilon - eps0) / (epsu - eps0))
+            return -f_cd * (1 - 0.8 * (epsilon - eps0) / (epsu - eps0))
         # 超过极限压应变：混凝土压碎
         else:
             return 0.0

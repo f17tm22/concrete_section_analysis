@@ -126,15 +126,66 @@ class RCSectionAnalyzer:
         self.steel_positions = []
         self.steel_areas = []
         
-        # 顶部钢筋位置：轮廓顶部y坐标 - 保护层厚度
-        top_pos = max_y - self.reinforcement["top"]["depth"]
-        self.steel_positions.append(top_pos)
-        self.steel_areas.append(self.reinforcement["top"]["area"])
+        # 遍历 reinforcement 字典，支持任意层名称
+        # 约定：
+        # - "top": 距离顶部 max_y 的深度
+        # - "bottom": 距离底部 min_y 的深度
+        # - "middle": 距离中和轴 y=0 的深度（正值向下？还是绝对值？）
+        #   或者简单起见，如果不是 top/bottom，我们假设 depth 是相对于 max_y 的深度？
+        #   或者我们看 irregular_section.py 的用法：
+        #   "middle": {"area": ..., "depth": 50} -> y = -200 + 50 = -150. 
+        #   Wait, in irregular_section.py:
+        #   (-200, 200) is a contour point.
+        #   It seems "middle" logic in irregular_section.py was specific to that example.
+        #   Let's try to be more generic.
+        #   If key is "top", pos = max_y - depth
+        #   If key is "bottom", pos = min_y + depth
+        #   If key is anything else, we might need a convention.
+        #   Let's assume for now we only support top/bottom/middle where middle is at y=0 if depth is not specified, 
+        #   or maybe we should just iterate and check keys.
         
-        # 底部钢筋位置：轮廓底部y坐标 + 保护层厚度
-        bottom_pos = min_y + self.reinforcement["bottom"]["depth"]
-        self.steel_positions.append(bottom_pos)
-        self.steel_areas.append(self.reinforcement["bottom"]["area"])
+        # 为了兼容旧代码，先处理 top 和 bottom
+        if "top" in self.reinforcement:
+            top_pos = max_y - self.reinforcement["top"]["depth"]
+            self.steel_positions.append(top_pos)
+            self.steel_areas.append(self.reinforcement["top"]["area"])
+            
+        if "bottom" in self.reinforcement:
+            bottom_pos = min_y + self.reinforcement["bottom"]["depth"]
+            self.steel_positions.append(bottom_pos)
+            self.steel_areas.append(self.reinforcement["bottom"]["area"])
+            
+        # 处理其他层（如 middle）
+        for key, info in self.reinforcement.items():
+            if key in ["top", "bottom"]:
+                continue
+            
+            # 对于其他层，我们需要一种定位方式。
+            # 暂时假设：如果 key 包含 "middle"，则位于 y=0 附近？
+            # 或者更灵活地，如果 info 中包含 'y' 坐标，则直接使用。
+            # 但 config 文件只提供了 depth。
+            # 让我们假设 'middle' 位于截面高度的一半处？
+            # 或者，对于不规则截面，通常需要指定具体的 y 坐标。
+            # 既然 config 没提供 y，那 irregular_section.py 是怎么做的？
+            # 它其实没做！它只是定义了 "middle" 但 analyzer 忽略了它。
+            # 除非我们修改 config 结构或 analyzer 逻辑。
+            
+            # 让我们做一个简单的改进：
+            # 如果 key 是 "middle"，我们将其放在 (max_y + min_y) / 2 处？
+            # 或者，如果 info 中有 'y' 键，则使用它。
+            
+            if "y" in info:
+                pos = info["y"]
+                self.steel_positions.append(pos)
+                self.steel_areas.append(info["area"])
+            elif key == "middle":
+                # 简单处理：放在几何中心
+                pos = (max_y + min_y) / 2
+                self.steel_positions.append(pos)
+                self.steel_areas.append(info["area"])
+            else:
+                # 其他未知层，暂时忽略并打印警告
+                print(f"Warning: Unknown reinforcement layer '{key}' ignored.")
     
     def set_materials(self, concrete_type, steel_type):
         """保持不变"""
@@ -208,6 +259,11 @@ class RCSectionAnalyzer:
         return epsilon0_sol, N, M
     
     def analyze_full_range(self, N_target=0, kappa_start=0, kappa_end=0.001, n_steps=100):
+        # 增加曲率扫描范围，确保能捕捉到极限状态
+        # 对于大偏心受压，曲率可能较大
+        if kappa_end < 0.05:
+             kappa_end = 0.05
+             
         kappas = np.linspace(kappa_start, kappa_end, n_steps)
         moments = []
         epsilons0 = []
@@ -233,6 +289,25 @@ class RCSectionAnalyzer:
                         "min_eps_concrete": min_eps_concrete,
                         "failure_mode": f"混凝土达到极限压应变 {self.epsu:.6f}"
                     }
+                
+                # 增加受拉破坏判断：钢筋达到极限拉应变（通常取0.01）
+                # 注意：这里简单取最外侧受拉钢筋应变判断，实际应遍历所有钢筋
+                max_steel_strain = -999
+                for pos in self.steel_positions:
+                    strain = epsilon0 + kappa * pos
+                    if strain > max_steel_strain:
+                        max_steel_strain = strain
+                
+                if max_steel_strain >= 0.01:
+                     return {
+                        "kappas": kappas[:len(moments)],
+                        "moments": moments,
+                        "epsilons0": epsilons0,
+                        "max_eps_concrete": max_eps_concrete,
+                        "min_eps_concrete": min_eps_concrete,
+                        "failure_mode": "钢筋达到极限拉应变 0.01"
+                    }
+
             except Exception as e:
                 print(f"在曲率 {kappa} 处无法收敛: {str(e)}")
                 break
